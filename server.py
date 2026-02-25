@@ -16,11 +16,7 @@ BANNER = """
 
 
 def read_line(conn):
-    """
-    Read a line from the client.
-    Handles both char-by-char and bulk (line-at-once) input.
-    Returns the line string or None on error/timeout.
-    """
+    """Read a full line from client. Returns string or None on error."""
     buf = b""
     try:
         conn.settimeout(TIMEOUT_SECONDS + 60)
@@ -29,19 +25,20 @@ def read_line(conn):
             if not chunk:
                 return None
             buf += chunk
-            # Check if we have a newline yet
-            if b"\n" in buf or b"\r" in buf:
-                # Extract first line
-                for sep in (b"\r\n", b"\n", b"\r"):
-                    if sep in buf:
-                        line, _ = buf.split(sep, 1)
-                        return line.decode(errors="ignore").strip()
+            for sep in (b"\r\n", b"\n", b"\r"):
+                if sep in buf:
+                    line, _ = buf.split(sep, 1)
+                    return line.decode(errors="ignore").strip()
     except:
         return None
 
 
 def relay(sender, receiver, sender_name, stop_event):
-    """Read messages from sender and forward to receiver."""
+    """
+    Read messages from sender, forward to receiver.
+    Format sent to receiver:  MSG:<name>:<message>
+    Nothing is sent back to sender (no echo).
+    """
     buf = b""
     try:
         while not stop_event.is_set():
@@ -58,39 +55,37 @@ def relay(sender, receiver, sender_name, stop_event):
 
             buf += chunk
 
-            while b"\n" in buf or b"\r\n" in buf:
-                for sep in (b"\r\n", b"\n"):
-                    if sep in buf:
-                        line, buf = buf.split(sep, 1)
-                        msg = line.decode(errors="ignore").strip()
-                        if not msg:
-                            continue
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                msg = line.replace(b"\r", b"").decode(errors="ignore").strip()
+                if not msg:
+                    continue
 
-                        if msg.lower() == "/quit":
-                            try:
-                                receiver.send(b"\r\n  [Partner has left the chat. Goodbye!]\r\n")
-                            except:
-                                pass
-                            stop_event.set()
-                            return
+                if msg.lower() == "/quit":
+                    try:
+                        receiver.send(b"SYS:Partner has left the chat. Goodbye!\n")
+                    except:
+                        pass
+                    stop_event.set()
+                    return
 
-                        try:
-                            receiver.send(f"\r\n  {sender_name}: {msg}\r\n  You: ".encode())
-                            sender.send(b"  You: ")
-                        except:
-                            stop_event.set()
-                            return
-                        break
+                # Send to receiver in a clean parseable format
+                # MSG:<sender_name>:<message>
+                try:
+                    receiver.send(f"MSG:{sender_name}:{msg}\n".encode())
+                except:
+                    stop_event.set()
+                    return
+
     except:
         pass
     finally:
         stop_event.set()
 
 
-def send(conn, msg):
-    """Helper to safely send a message."""
+def send_msg(conn, msg):
     try:
-        conn.send(msg if isinstance(msg, bytes) else msg.encode())
+        conn.send((msg + "\n").encode())
         return True
     except:
         return False
@@ -99,104 +94,85 @@ def send(conn, msg):
 def handle_client(conn, addr):
     print(f"[+] Connection from {addr}")
     try:
-        # Welcome banner
-        send(conn, "\r\n")
-        send(conn, "  ============================================\r\n")
-        send(conn, "           Welcome to NormansChat            \r\n")
-        send(conn, "  ============================================\r\n\r\n")
+        send_msg(conn, "SYS:Welcome to NormansChat!")
+        send_msg(conn, "PROMPT:name")
 
-        # Ask for display name
-        send(conn, "  Enter your display name: ")
         name = read_line(conn)
         if not name:
-            send(conn, "\r\n  Invalid name. Disconnecting.\r\n")
             return
         name = name.strip()
-        send(conn, f"\r\n  Hello, {name}!\r\n\r\n")
+        send_msg(conn, f"SYS:Hello {name}!")
 
-        # Ask for room ID
-        send(conn, "  Enter a Room ID to create or join a chat room.\r\n")
-        send(conn, "  (Both people must enter the same Room ID to connect)\r\n\r\n")
-        send(conn, "  Room ID: ")
+        send_msg(conn, "PROMPT:room")
+
         room_id = read_line(conn)
         if not room_id:
-            send(conn, "\r\n  Invalid Room ID. Disconnecting.\r\n")
             return
         room_id = room_id.strip().upper()
-        send(conn, f"\r\n")
 
         joining = False
-        partner_conn = None
-        partner_name = None
-        entry = None
+        entry   = None
 
         with rooms_lock:
             if room_id in rooms:
-                # Join existing room
-                entry = rooms.pop(room_id)
-                partner_conn = entry["conn"]
-                partner_name = entry["name"]
+                entry   = rooms.pop(room_id)
                 joining = True
             else:
-                # Create new room
                 event = threading.Event()
                 entry = {
-                    "conn": conn,
-                    "name": name,
-                    "event": event,
+                    "conn":         conn,
+                    "name":         name,
+                    "event":        event,
                     "partner_conn": None,
                     "partner_name": None,
-                    "created_at": time.time()
+                    "created_at":   time.time()
                 }
                 rooms[room_id] = entry
 
         if not joining:
             mins = TIMEOUT_SECONDS // 60
-            send(conn, f"  Room [{room_id}] created!\r\n")
-            send(conn, f"  Waiting for your partner to join...\r\n")
-            send(conn, f"  (Room closes automatically in {mins} minutes if no one joins)\r\n")
+            send_msg(conn, f"SYS:Room [{room_id}] created! Waiting for partner...")
+            send_msg(conn, f"SYS:Room closes in {mins} mins if nobody joins.")
 
             fired = entry["event"].wait(timeout=TIMEOUT_SECONDS)
 
             if not fired or entry.get("partner_conn") is None:
                 with rooms_lock:
                     rooms.pop(room_id, None)
-                send(conn, "\r\n  No one joined. Room closed. Goodbye!\r\n")
+                send_msg(conn, "SYS:No one joined. Room closed. Goodbye!")
                 return
 
             partner_conn = entry["partner_conn"]
             partner_name = entry["partner_name"]
 
-            send(conn, f"\r\n  ----------------------------------------\r\n")
-            send(conn, f"  {partner_name} joined the room!\r\n")
-            send(conn, f"  You are now chatting with {partner_name}.\r\n")
-            send(conn, f"  Type /quit to leave.\r\n")
-            send(conn, f"  ----------------------------------------\r\n\r\n")
-            send(conn, "  You: ")
+            send_msg(conn, f"CONNECTED:{partner_name}")
 
         else:
-            # Signal the room creator
+            partner_conn = entry["conn"]
+            partner_name = entry["name"]
+
             entry["partner_conn"] = conn
             entry["partner_name"] = name
             entry["event"].set()
 
-            send(conn, f"  ----------------------------------------\r\n")
-            send(conn, f"  Connected! Chatting with {partner_name}.\r\n")
-            send(conn, f"  Type /quit to leave.\r\n")
-            send(conn, f"  ----------------------------------------\r\n\r\n")
-            send(conn, "  You: ")
+            send_msg(conn, f"CONNECTED:{partner_name}")
+            # Also notify the waiting person
+            try:
+                partner_conn.send(f"CONNECTED:{name}\n".encode())
+            except:
+                pass
 
-            time.sleep(0.3)
+            time.sleep(0.2)
 
-        # Start chat relay
+        # Start relay threads
         stop_event = threading.Event()
-        t1 = threading.Thread(target=relay, args=(conn, partner_conn, name, stop_event), daemon=True)
-        t2 = threading.Thread(target=relay, args=(partner_conn, conn, partner_name, stop_event), daemon=True)
+        t1 = threading.Thread(target=relay, args=(conn,         partner_conn, name,         stop_event), daemon=True)
+        t2 = threading.Thread(target=relay, args=(partner_conn, conn,         partner_name, stop_event), daemon=True)
         t1.start()
         t2.start()
         stop_event.wait()
 
-        print(f"[-] Chat ended: [{room_id}] between {name} and {partner_name}")
+        print(f"[-] Chat ended: [{room_id}] {name} <-> {partner_name}")
 
     except Exception as e:
         print(f"[ERROR] {addr}: {e}")
@@ -208,23 +184,19 @@ def handle_client(conn, addr):
 
 
 def cleanup_expired_rooms():
-    """Background thread: close rooms that have been waiting too long."""
     while True:
         time.sleep(30)
         now = time.time()
         with rooms_lock:
-            expired = [
-                code for code, entry in rooms.items()
-                if now - entry.get("created_at", now) > TIMEOUT_SECONDS
-            ]
+            expired = [c for c, e in rooms.items() if now - e.get("created_at", now) > TIMEOUT_SECONDS]
             for code in expired:
-                entry = rooms.pop(code)
+                e = rooms.pop(code)
                 try:
-                    entry["conn"].send(b"\r\n  [Room expired. No one joined. Goodbye!]\r\n")
-                    entry["conn"].close()
+                    e["conn"].send(b"SYS:Room expired. No one joined. Goodbye!\n")
+                    e["conn"].close()
                 except:
                     pass
-                print(f"[~] Room [{code}] expired and closed.")
+                print(f"[~] Room [{code}] expired.")
 
 
 def main():
@@ -235,8 +207,8 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", 9999))
     server.listen(100)
-    print("[*] Server listening on port 9999...")
-    print(f"[*] Rooms expire after {TIMEOUT_SECONDS // 60} minutes if no one joins.\n")
+    print("[*] Listening on port 9999...")
+    print(f"[*] Rooms expire after {TIMEOUT_SECONDS // 60} mins if empty.\n")
 
     while True:
         try:
@@ -246,7 +218,7 @@ def main():
             print("\n[*] Shutting down.")
             break
         except Exception as e:
-            print(f"[ERROR] Accept: {e}")
+            print(f"[ERROR] {e}")
 
     server.close()
 
